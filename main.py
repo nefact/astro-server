@@ -3,6 +3,15 @@ from kerykeion import AstrologicalSubject
 from pydantic import BaseModel
 
 app = FastAPI()
+from fastapi.responses import HTMLResponse
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy():
+    return """<h1>Privacy Policy</h1>
+    <p>This service calculates astrological charts from birth data
+    provided by the user. Data is processed in memory only and is
+    not stored, logged, or shared with third parties.</p>"""
+
 
 class BirthData(BaseModel):
     name: str
