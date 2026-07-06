@@ -79,9 +79,16 @@ def build_response(s: AstrologicalSubject) -> dict:
             "neptune": s.neptune,
             "pluto": s.pluto,
         },
-        "ascendant": s.first_house,
-        "houses": s.houses_list,
-    }
+               "ascendant": s.first_house,
+        "houses": {
+            "1": s.first_house, "2": s.second_house,
+            "3": s.third_house, "4": s.fourth_house,
+            "5": s.fifth_house, "6": s.sixth_house,
+            "7": s.seventh_house, "8": s.eighth_house,
+            "9": s.ninth_house, "10": s.tenth_house,
+            "11": s.eleventh_house, "12": s.twelfth_house,
+        },
+
 
 
 # ---------- Main endpoint: by city name ----------
