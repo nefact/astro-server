@@ -1,8 +1,10 @@
 import glob
+import math
 import os
 import tempfile
 import urllib.parse
 from datetime import datetime
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import swisseph as swe
@@ -19,7 +21,7 @@ except ImportError:
 app = FastAPI(
     title="Astro Server",
     description="Astrology & Human Design calculation service for Custom GPT",
-    version="6.0",
+    version="7.0",
 )
 
 GEONAMES_USERNAME = os.environ.get("GEONAMES_USERNAME", "")
@@ -58,6 +60,12 @@ class BirthDataCoords(BaseModel):
     lng: float = Field(ge=-180, le=180)
     tz_str: str
     city: str = "Custom location"
+
+
+class AstroCartographyRequest(BirthDataCoords):
+    check_lat: Optional[float] = Field(default=None, ge=-90, le=90)
+    check_lng: Optional[float] = Field(default=None, ge=-180, le=180)
+    check_name: str = "checked location"
 
 
 # =====================================================
@@ -120,7 +128,7 @@ def natal_chart(data: BirthData):
         s = AstrologicalSubject(
             data.name, data.year, data.month, data.day,
             data.hour, data.minute, data.city, data.nation,
-            geonames_username="ne_fact",
+            geonames_username=GEONAMES_USERNAME,
         )
         return build_response(s, data.name)
     except Exception as e:
@@ -467,6 +475,138 @@ def gene_keys(data: BirthDataCoords):
     except Exception as e:
         raise HTTPException(status_code=422,
                             detail=f"Gene Keys calculation error: {e}")
+
+
+# =====================================================
+# AstroCartography
+# =====================================================
+
+def equatorial(jd: float, body: int):
+    """Right ascension and declination in degrees."""
+    res, _ = swe.calc_ut(jd, body, swe.FLG_SWIEPH | swe.FLG_EQUATORIAL)
+    return res[0], res[1]
+
+
+def norm180(x: float) -> float:
+    x = x % 360.0
+    return x - 360.0 if x > 180.0 else x
+
+
+def mc_ic_longitude(ra_deg: float, gst_deg: float):
+    mc = norm180(ra_deg - gst_deg)
+    ic = norm180(mc + 180.0)
+    return mc, ic
+
+
+def rise_set_curve(ra_deg: float, dec_deg: float, gst_deg: float,
+                   lat_step: int = 5):
+    """Sampled AC (rising) and DC (setting) curves. Skips latitudes
+    where the planet is circumpolar or never rises (no solution)."""
+    rise_pts, set_pts = [], []
+    dec = math.radians(dec_deg)
+    for lat_i in range(-65, 66, lat_step):
+        phi = math.radians(lat_i)
+        cos_h0 = -math.tan(phi) * math.tan(dec)
+        if abs(cos_h0) > 1:
+            continue
+        h0 = math.degrees(math.acos(cos_h0))
+        rise_pts.append({"lat": lat_i,
+                         "lng": round(norm180((ra_deg - h0) - gst_deg), 3)})
+        set_pts.append({"lat": lat_i,
+                        "lng": round(norm180((ra_deg + h0) - gst_deg), 3)})
+    return rise_pts, set_pts
+
+
+def haversine_km(lat1, lng1, lat2, lng2) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def meridian_distance_km(check_lat, check_lng, line_lng) -> float:
+    dlon = norm180(check_lng - line_lng)
+    return abs(math.radians(dlon)) * 6371.0 * math.cos(math.radians(check_lat))
+
+
+@app.post("/astrocartography", dependencies=[Depends(verify_api_key)])
+def astrocartography(data: AstroCartographyRequest):
+    """Calculate astrocartography lines: MC/IC meridians and AC/DC
+    curves for all planets. Optionally pass check_lat/check_lng to
+    get distances from a place to each line. Requires coordinates
+    and timezone; this module is new and not yet cross-verified."""
+    try:
+        tz = ZoneInfo(data.tz_str)
+    except Exception:
+        raise HTTPException(status_code=422, detail=(
+            f"Unknown timezone '{data.tz_str}'. Use IANA format, "
+            "e.g. 'Europe/Moscow' - not 'UTC+3'."
+        ))
+    try:
+        local = datetime(data.year, data.month, data.day,
+                         data.hour, data.minute, tzinfo=tz)
+        ut = local.astimezone(ZoneInfo("UTC"))
+        jd = swe.julday(ut.year, ut.month, ut.day,
+                        ut.hour + ut.minute / 60 + ut.second / 3600)
+        gst_deg = swe.sidtime(jd) * 15.0
+
+        lines = {}
+        nearest = []
+        for key, body in SWE_PLANETS:
+            ra, dec = equatorial(jd, body)
+            mc, ic = mc_ic_longitude(ra, gst_deg)
+            ac_line, dc_line = rise_set_curve(ra, dec, gst_deg)
+            lines[key] = {
+                "mc_longitude": round(mc, 3),
+                "ic_longitude": round(ic, 3),
+                "ac_line": ac_line,
+                "dc_line": dc_line,
+            }
+            if data.check_lat is not None and data.check_lng is not None:
+                nearest.append({"planet": key, "line": "MC",
+                    "distance_km": round(meridian_distance_km(
+                        data.check_lat, data.check_lng, mc), 1)})
+                nearest.append({"planet": key, "line": "IC",
+                    "distance_km": round(meridian_distance_km(
+                        data.check_lat, data.check_lng, ic), 1)})
+                if ac_line:
+                    d = min(haversine_km(data.check_lat, data.check_lng,
+                                         p["lat"], p["lng"]) for p in ac_line)
+                    nearest.append({"planet": key, "line": "AC",
+                                    "distance_km": round(d, 1)})
+                if dc_line:
+                    d = min(haversine_km(data.check_lat, data.check_lng,
+                                         p["lat"], p["lng"]) for p in dc_line)
+                    nearest.append({"planet": key, "line": "DC",
+                                    "distance_km": round(d, 1)})
+
+        result = {
+            "verification_note": (
+                "New, not yet cross-verified module. Check against a "
+                "known astrocartography source (e.g. astro.com AstroClick "
+                "Travel) before treating as reliable. AC/DC curves are "
+                "sampled every 5 degrees of latitude, so distances to "
+                "these lines are approximate."
+            ),
+            "confidence": {"level": "unverified - new module"},
+            "lines": lines,
+        }
+        if data.check_lat is not None and data.check_lng is not None:
+            nearest.sort(key=lambda x: x["distance_km"])
+            result["nearest_lines_to_check_location"] = {
+                "location": data.check_name,
+                "lat": data.check_lat,
+                "lng": data.check_lng,
+                "closest_lines": nearest[:10],
+            }
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422,
+                            detail=f"AstroCartography calculation error: {e}")
 
 
 # =====================================================
