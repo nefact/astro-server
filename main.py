@@ -21,7 +21,7 @@ except ImportError:
 app = FastAPI(
     title="Astro Server",
     description="Astrology & Human Design calculation service for Custom GPT",
-    version="8.0",
+    version="9.0",
 )
 
 GEONAMES_USERNAME = os.environ.get("GEONAMES_USERNAME", "")
@@ -813,6 +813,250 @@ def vedic_chart(data: BirthDataCoords):
     except Exception as e:
         raise HTTPException(status_code=422,
                             detail=f"Vedic chart calculation error: {e}")
+
+
+# =====================================================
+# BaZi (Four Pillars of Destiny)
+# =====================================================
+
+BAZI_STEMS = ["Jia", "Yi", "Bing", "Ding", "Wu", "Ji", "Geng", "Xin", "Ren", "Gui"]
+BAZI_STEM_ELEMENT = ["Wood", "Wood", "Fire", "Fire", "Earth", "Earth",
+                     "Metal", "Metal", "Water", "Water"]
+BAZI_STEM_YANG = [True, False, True, False, True, False, True, False, True, False]
+
+BAZI_BRANCHES = ["Zi", "Chou", "Yin", "Mao", "Chen", "Si", "Wu", "Wei",
+                 "Shen", "You", "Xu", "Hai"]
+BAZI_BRANCH_ELEMENT = ["Water", "Earth", "Wood", "Wood", "Earth", "Fire",
+                       "Fire", "Earth", "Metal", "Metal", "Earth", "Water"]
+
+BAZI_HIDDEN_STEMS = {
+    "Zi": ["Gui"], "Chou": ["Ji", "Gui", "Xin"], "Yin": ["Jia", "Bing", "Wu"],
+    "Mao": ["Yi"], "Chen": ["Wu", "Yi", "Gui"], "Si": ["Bing", "Wu", "Geng"],
+    "Wu": ["Ding", "Ji"], "Wei": ["Ji", "Ding", "Yi"], "Shen": ["Geng", "Ren", "Wu"],
+    "You": ["Xin"], "Xu": ["Wu", "Xin", "Ding"], "Hai": ["Ren", "Jia"],
+}
+
+BAZI_FIVE_TIGER = {0: 2, 5: 2, 1: 4, 6: 4, 2: 6, 7: 6, 3: 8, 8: 8, 4: 0, 9: 0}
+BAZI_FIVE_RAT = {0: 0, 5: 0, 1: 2, 6: 2, 2: 4, 7: 4, 3: 6, 8: 6, 4: 8, 9: 8}
+
+BAZI_GENERATES = {"Wood": "Fire", "Fire": "Earth", "Earth": "Metal",
+                  "Metal": "Water", "Water": "Wood"}
+BAZI_CONTROLS = {"Wood": "Earth", "Earth": "Water", "Water": "Fire",
+                 "Fire": "Metal", "Metal": "Wood"}
+
+# The 12 "Jie" solar terms defining BaZi month boundaries, 30 degrees
+# apart in tropical solar longitude. Branch shown is fixed regardless
+# of year (Li Chun always starts the Yin month, etc).
+JIE_TERMS = [
+    ("Li Chun", 315.0, "Yin"), ("Jing Zhe", 345.0, "Mao"),
+    ("Qing Ming", 15.0, "Chen"), ("Li Xia", 45.0, "Si"),
+    ("Mang Zhong", 75.0, "Wu"), ("Xiao Shu", 105.0, "Wei"),
+    ("Li Qiu", 135.0, "Shen"), ("Bai Lu", 165.0, "You"),
+    ("Han Lu", 195.0, "Xu"), ("Li Dong", 225.0, "Hai"),
+    ("Da Xue", 255.0, "Zi"), ("Xiao Han", 285.0, "Chou"),
+]
+
+# Day-pillar epoch: 1900-01-31 (Gregorian) = Jia-Chen day, a commonly
+# used reference in Chinese calendar software. NOT independently
+# verified here (no ephemeris/historical-record access in this
+# environment) - check this specific anchor against an external BaZi
+# calculator before trusting the Day Master and anything derived from
+# it (Ten Gods, useful-element analysis).
+BAZI_EPOCH_JDN = 2415051
+BAZI_EPOCH_STEM = 0
+BAZI_EPOCH_BRANCH = 4
+
+
+def civil_jdn(year: int, month: int, day: int) -> int:
+    a = (14 - month) // 12
+    y = year + 4800 - a
+    m = month + 12 * a - 3
+    return (day + (153 * m + 2) // 5 + 365 * y + y // 4
+            - y // 100 + y // 400 - 32045)
+
+
+def sun_longitude(jd: float) -> float:
+    res, _ = swe.calc_ut(jd, swe.SUN, swe.FLG_SWIEPH)
+    return res[0] % 360.0
+
+
+def find_solar_term_jd(jd_guess: float, target_lon: float) -> float:
+    jd = jd_guess
+    for _ in range(50):
+        diff = ((target_lon - sun_longitude(jd) + 180.0) % 360.0) - 180.0
+        if abs(diff) < 1e-7:
+            break
+        jd += diff / 0.9856
+    return jd
+
+
+def bazi_stem_branch(idx_stem: int, idx_branch: int) -> dict:
+    return {
+        "stem": BAZI_STEMS[idx_stem],
+        "stem_element": BAZI_STEM_ELEMENT[idx_stem],
+        "stem_polarity": "Yang" if BAZI_STEM_YANG[idx_stem] else "Yin",
+        "branch": BAZI_BRANCHES[idx_branch],
+        "branch_element": BAZI_BRANCH_ELEMENT[idx_branch],
+        "hidden_stems": BAZI_HIDDEN_STEMS[BAZI_BRANCHES[idx_branch]],
+    }
+
+
+def bazi_ten_god(day_stem_idx: int, other_stem_idx: int) -> str:
+    de, dy = BAZI_STEM_ELEMENT[day_stem_idx], BAZI_STEM_YANG[day_stem_idx]
+    oe, oy = BAZI_STEM_ELEMENT[other_stem_idx], BAZI_STEM_YANG[other_stem_idx]
+    same = (dy == oy)
+    if oe == de:
+        return "Friend" if same else "Rob Wealth"
+    if BAZI_GENERATES[de] == oe:
+        return "Eating God" if same else "Hurting Officer"
+    if BAZI_CONTROLS[de] == oe:
+        return "Indirect Wealth" if same else "Direct Wealth"
+    if BAZI_CONTROLS[oe] == de:
+        return "Seven Killings" if same else "Direct Officer"
+    if BAZI_GENERATES[oe] == de:
+        return "Indirect Seal" if same else "Direct Seal"
+    return "Unknown"
+
+
+class BaziRequest(BirthDataCoords):
+    gender: str = Field(default="male", pattern="^(male|female)$")
+
+
+@app.post("/bazi_chart", dependencies=[Depends(verify_api_key)])
+def bazi_chart(data: BaziRequest):
+    """Calculate a BaZi (Four Pillars) chart: year/month/day/hour
+    stems and branches, hidden stems, Ten Gods vs the Day Master, and
+    Luck Pillars. New module - the day-pillar epoch is not
+    independently verified; check the Day Master against a reference
+    before trusting derived Ten God analysis."""
+    try:
+        tz = ZoneInfo(data.tz_str)
+    except Exception:
+        raise HTTPException(status_code=422, detail=(
+            f"Unknown timezone '{data.tz_str}'. Use IANA format, "
+            "e.g. 'Europe/Moscow' - not 'UTC+3'."
+        ))
+    try:
+        local = datetime(data.year, data.month, data.day,
+                         data.hour, data.minute, tzinfo=tz)
+        ut = local.astimezone(ZoneInfo("UTC"))
+        jd = swe.julday(ut.year, ut.month, ut.day,
+                        ut.hour + ut.minute / 60 + ut.second / 3600)
+
+        # --- Year pillar (boundary = Li Chun of the Gregorian year) ---
+        li_chun_guess = swe.julday(data.year, 2, 4, 12.0)
+        li_chun_jd = find_solar_term_jd(li_chun_guess, 315.0)
+        bazi_year = data.year if jd >= li_chun_jd else data.year - 1
+        year_stem_idx = (bazi_year - 4) % 10
+        year_branch_idx = (bazi_year - 4) % 12
+
+        # --- Month pillar: bracket birth between consecutive Jie terms ---
+        this_year_terms = [
+            (name, branch, find_solar_term_jd(
+                swe.julday(data.year, 2, 4, 12.0), lon))
+            for name, lon, branch in JIE_TERMS
+        ]
+        prev_year_terms = [
+            (name, branch, find_solar_term_jd(
+                swe.julday(data.year - 1, 2, 4, 12.0), lon))
+            for name, lon, branch in JIE_TERMS
+        ]
+        all_terms = sorted(this_year_terms + prev_year_terms,
+                           key=lambda t: t[2])
+
+        month_branch = None
+        prev_term_jd = next_term_jd = None
+        for i in range(len(all_terms) - 1):
+            if all_terms[i][2] <= jd < all_terms[i + 1][2]:
+                month_branch = all_terms[i][1]
+                prev_term_jd = all_terms[i][2]
+                next_term_jd = all_terms[i + 1][2]
+                break
+        if month_branch is None:
+            raise RuntimeError("could not bracket birth date between solar terms")
+
+        month_branch_idx = BAZI_BRANCHES.index(month_branch)
+        month_offset = (month_branch_idx - 2) % 12
+        month_stem_idx = (BAZI_FIVE_TIGER[year_stem_idx] + month_offset) % 10
+
+        # --- Day pillar: continuous 60-cycle from the reference epoch ---
+        day_jdn = civil_jdn(local.year, local.month, local.day)
+        offset = day_jdn - BAZI_EPOCH_JDN
+        day_stem_idx = (BAZI_EPOCH_STEM + offset) % 10
+        day_branch_idx = (BAZI_EPOCH_BRANCH + offset) % 12
+
+        # --- Hour pillar ---
+        h = local.hour
+        hour_branch_idx = ((h + 1) // 2) % 12
+        hour_stem_idx = (BAZI_FIVE_RAT[day_stem_idx] + hour_branch_idx) % 10
+
+        pillars = {
+            "year": bazi_stem_branch(year_stem_idx, year_branch_idx),
+            "month": bazi_stem_branch(month_stem_idx, month_branch_idx),
+            "day": bazi_stem_branch(day_stem_idx, day_branch_idx),
+            "hour": bazi_stem_branch(hour_stem_idx, hour_branch_idx),
+        }
+        for key, p in pillars.items():
+            stem_idx = BAZI_STEMS.index(p["stem"])
+            p["ten_god_of_stem"] = ("Day Master" if key == "day"
+                                    else bazi_ten_god(day_stem_idx, stem_idx))
+            p["ten_gods_of_hidden_stems"] = [
+                bazi_ten_god(day_stem_idx, BAZI_STEMS.index(hs))
+                for hs in p["hidden_stems"]
+            ]
+
+        # --- Luck Pillars (Da Yun), 10-year periods ---
+        year_is_yang = BAZI_STEM_YANG[year_stem_idx]
+        male = (data.gender == "male")
+        forward = (year_is_yang and male) or (not year_is_yang and not male)
+        days_to_boundary = (next_term_jd - jd) if forward else (jd - prev_term_jd)
+        start_age_years = days_to_boundary / 3.0
+
+        luck_pillars = []
+        cur_stem, cur_branch = month_stem_idx, month_branch_idx
+        for i in range(8):
+            if forward:
+                cur_stem = (cur_stem + 1) % 10
+                cur_branch = (cur_branch + 1) % 12
+            else:
+                cur_stem = (cur_stem - 1) % 10
+                cur_branch = (cur_branch - 1) % 12
+            entry = bazi_stem_branch(cur_stem, cur_branch)
+            entry["start_age"] = round(start_age_years + i * 10, 2)
+            entry["ten_god_of_stem"] = bazi_ten_god(day_stem_idx, cur_stem)
+            luck_pillars.append(entry)
+
+        return {
+            "verification_note": (
+                "New, not yet cross-verified module. The Day Pillar "
+                "uses a reference epoch (1900-01-31 = Jia-Chen day) "
+                "that could not be independently verified in this "
+                "environment - check the Day Master against a known "
+                "BaZi calculator FIRST, since Ten Gods and all "
+                "interpretation depend on it. Year/Month boundaries "
+                "come from actual solar-term longitudes via ephemeris, "
+                "which is separately checkable. Day boundary is "
+                "assumed at local midnight; some schools use 23:00 "
+                "(late Zi) instead - a known disagreement between "
+                "schools, not a bug."
+            ),
+            "confidence": {
+                "year_month_pillars": "computed from solar terms - checkable",
+                "day_pillar": "UNVERIFIED EPOCH - check this first",
+                "hour_pillar": "depends on day pillar",
+                "luck_pillars": "depends on day/month pillar and gender",
+            },
+            "day_master": BAZI_STEMS[day_stem_idx],
+            "day_master_element": BAZI_STEM_ELEMENT[day_stem_idx],
+            "day_master_polarity": "Yang" if BAZI_STEM_YANG[day_stem_idx] else "Yin",
+            "pillars": pillars,
+            "luck_pillars": luck_pillars,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422,
+                            detail=f"BaZi calculation error: {e}")
 
 
 @app.get("/privacy", response_class=HTMLResponse)
