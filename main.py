@@ -88,7 +88,7 @@ def build_response(s: AstrologicalSubject) -> dict:
             "9": s.ninth_house, "10": s.tenth_house,
             "11": s.eleventh_house, "12": s.twelfth_house,
         },
-
+ },
 
 
 # ---------- Main endpoint: by city name ----------
