@@ -3,7 +3,7 @@ import math
 import os
 import tempfile
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -21,7 +21,7 @@ except ImportError:
 app = FastAPI(
     title="Astro Server",
     description="Astrology & Human Design calculation service for Custom GPT",
-    version="7.0",
+    version="8.0",
 )
 
 GEONAMES_USERNAME = os.environ.get("GEONAMES_USERNAME", "")
@@ -128,7 +128,7 @@ def natal_chart(data: BirthData):
         s = AstrologicalSubject(
             data.name, data.year, data.month, data.day,
             data.hour, data.minute, data.city, data.nation,
-            geonames_username="ne_fact",
+            geonames_username"ne_fact",
         )
         return build_response(s, data.name)
     except Exception as e:
@@ -610,6 +610,210 @@ def astrocartography(data: AstroCartographyRequest):
 
 
 # =====================================================
+# Vedic Astrology (Jyotish) - sidereal zodiac, Lahiri ayanamsha
+# =====================================================
+
+RASHIS = ["Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+         "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces"]
+
+NAKSHATRAS = ["Ashwini", "Bharani", "Krittika", "Rohini", "Mrigashira", "Ardra",
+    "Punarvasu", "Pushya", "Ashlesha", "Magha", "Purva Phalguni",
+    "Uttara Phalguni", "Hasta", "Chitra", "Swati", "Vishakha", "Anuradha",
+    "Jyeshtha", "Mula", "Purva Ashadha", "Uttara Ashadha", "Shravana",
+    "Dhanishta", "Shatabhisha", "Purva Bhadrapada", "Uttara Bhadrapada", "Revati"]
+
+NAKSHATRA_SPAN = 360.0 / 27
+PADA_SPAN = NAKSHATRA_SPAN / 4
+
+DASHA_ORDER = ["Ketu", "Venus", "Sun", "Moon", "Mars", "Rahu",
+              "Jupiter", "Saturn", "Mercury"]
+DASHA_YEARS = {"Ketu": 7, "Venus": 20, "Sun": 6, "Moon": 10, "Mars": 7,
+              "Rahu": 18, "Jupiter": 16, "Saturn": 19, "Mercury": 17}
+
+# Days per dasha-year: classical Vimshottari software commonly uses the
+# Julian year (365.25 days), not the Gregorian mean year (365.2425) or
+# the sidereal year (365.25636). Using a different convention shifts
+# mahadasha transition dates by roughly a day per decade - noted in the
+# response so this is diagnosable if dates don't match a reference tool.
+DASHA_DAYS_PER_YEAR = 365.25
+
+VEDIC_BODIES = [
+    ("sun", swe.SUN), ("moon", swe.MOON), ("mercury", swe.MERCURY),
+    ("venus", swe.VENUS), ("mars", swe.MARS), ("jupiter", swe.JUPITER),
+    ("saturn", swe.SATURN), ("uranus", swe.URANUS),
+    ("neptune", swe.NEPTUNE), ("pluto", swe.PLUTO),
+]
+
+
+def tropical_lon_and_speed(jd: float, body: int):
+    res, _ = swe.calc_ut(jd, body, swe.FLG_SWIEPH)
+    return res[0] % 360.0, res[3]
+
+
+def ayanamsha_deg(jd: float) -> float:
+    swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
+    return swe.get_ayanamsa_ut(jd)
+
+
+def sign_and_degree(sid_lon: float):
+    idx = int(sid_lon // 30) % 12
+    return RASHIS[idx], idx, round(sid_lon % 30, 3)
+
+
+def nakshatra_info(sid_lon: float):
+    idx = int(sid_lon // NAKSHATRA_SPAN) % 27
+    pos = sid_lon % NAKSHATRA_SPAN
+    pada = int(pos // PADA_SPAN) + 1
+    lord = DASHA_ORDER[idx % 9]
+    fraction = pos / NAKSHATRA_SPAN
+    return NAKSHATRAS[idx], pada, lord, fraction
+
+
+def build_vimshottari(start_lord: str, fraction_traversed: float,
+                      birth_utc: datetime, min_years: float = 125.0):
+    sequence = []
+    balance = DASHA_YEARS[start_lord] * (1 - fraction_traversed)
+    cursor = birth_utc
+    end = cursor + timedelta(days=balance * DASHA_DAYS_PER_YEAR)
+    sequence.append({
+        "lord": start_lord,
+        "years": round(balance, 3),
+        "start": cursor.isoformat(),
+        "end": end.isoformat(),
+    })
+    total = balance
+    cursor = end
+    idx = DASHA_ORDER.index(start_lord)
+    i = 1
+    while total < min_years:
+        lord = DASHA_ORDER[(idx + i) % 9]
+        years = DASHA_YEARS[lord]
+        end = cursor + timedelta(days=years * DASHA_DAYS_PER_YEAR)
+        sequence.append({
+            "lord": lord, "years": years,
+            "start": cursor.isoformat(), "end": end.isoformat(),
+        })
+        total += years
+        cursor = end
+        i += 1
+    return sequence
+
+
+def point_details(sid_lon: float, asc_sign_idx: int) -> dict:
+    sign, sign_idx, deg = sign_and_degree(sid_lon)
+    nak, pada, lord, frac = nakshatra_info(sid_lon)
+    house = ((sign_idx - asc_sign_idx) % 12) + 1
+    return {
+        "sidereal_longitude": round(sid_lon, 3),
+        "sign": sign, "degree_in_sign": deg,
+        "nakshatra": nak, "pada": pada,
+        "nakshatra_lord": lord, "house": house,
+    }
+
+
+@app.post("/vedic_chart", dependencies=[Depends(verify_api_key)])
+def vedic_chart(data: BirthDataCoords):
+    """Calculate a Vedic (Jyotish) chart: sidereal planet positions
+    (Lahiri ayanamsha), nakshatras/padas, whole-sign houses, and the
+    Vimshottari Dasha sequence from birth. Requires coordinates and
+    timezone; this module is new and not yet cross-verified."""
+    try:
+        tz = ZoneInfo(data.tz_str)
+    except Exception:
+        raise HTTPException(status_code=422, detail=(
+            f"Unknown timezone '{data.tz_str}'. Use IANA format, "
+            "e.g. 'Europe/Moscow' - not 'UTC+3'."
+        ))
+    try:
+        local = datetime(data.year, data.month, data.day,
+                         data.hour, data.minute, tzinfo=tz)
+        ut = local.astimezone(ZoneInfo("UTC"))
+        jd = swe.julday(ut.year, ut.month, ut.day,
+                        ut.hour + ut.minute / 60 + ut.second / 3600)
+
+        ayan = ayanamsha_deg(jd)
+
+        cusps, ascmc = swe.houses_ex(jd, data.lat, data.lng, b"P")
+        asc_sid = (ascmc[0] - ayan) % 360.0
+        asc_sign, asc_sign_idx, asc_deg = sign_and_degree(asc_sid)
+        asc_nak, asc_pada, _, _ = nakshatra_info(asc_sid)
+
+        planets = {}
+        for key, body in VEDIC_BODIES:
+            trop, speed = tropical_lon_and_speed(jd, body)
+            sid = (trop - ayan) % 360.0
+            details = point_details(sid, asc_sign_idx)
+            details["retrograde"] = speed < 0
+            planets[key] = details
+
+        # Lunar nodes: both True Node and Mean Node are computed and
+        # labeled, since Vedic software commonly differs on which one
+        # it uses for Rahu/Ketu (a frequent source of small mismatches).
+        true_node_trop, _ = tropical_lon_and_speed(jd, swe.TRUE_NODE)
+        mean_node_trop, _ = tropical_lon_and_speed(jd, swe.MEAN_NODE)
+        true_rahu_sid = (true_node_trop - ayan) % 360.0
+        mean_rahu_sid = (mean_node_trop - ayan) % 360.0
+
+        planets["rahu_true_node"] = point_details(true_rahu_sid, asc_sign_idx)
+        planets["ketu_true_node"] = point_details(
+            (true_rahu_sid + 180.0) % 360.0, asc_sign_idx)
+        planets["rahu_mean_node"] = point_details(mean_rahu_sid, asc_sign_idx)
+        planets["ketu_mean_node"] = point_details(
+            (mean_rahu_sid + 180.0) % 360.0, asc_sign_idx)
+
+        # Dasha is computed from the Moon's nakshatra - node choice
+        # does not affect this part.
+        moon_nak, moon_pada, moon_lord, moon_frac = nakshatra_info(
+            planets["moon"]["sidereal_longitude"])
+        dasha_sequence = build_vimshottari(moon_lord, moon_frac, ut)
+
+        houses_whole_sign = {
+            str(h + 1): RASHIS[(asc_sign_idx + h) % 12] for h in range(12)
+        }
+
+        return {
+            "verification_note": (
+                "New, not yet cross-verified module. Check against a "
+                "known Vedic calculator (e.g. drikpanchang.com or "
+                "Prokerala) before treating as reliable. Two conventions "
+                "are exposed explicitly because different software "
+                "disagrees on them: rahu/ketu are given as both "
+                "true_node and mean_node (compare to whichever your "
+                "reference uses); mahadasha dates use 365.25 days/year "
+                "(Julian year), which may drift by about a day per "
+                "decade versus tools using a different year length. "
+                "The Ascendant is assumed to be house-system-independent "
+                "(same rising degree regardless of house system)."
+            ),
+            "confidence": {"level": "unverified - new module"},
+            "ayanamsha": {"mode": "Lahiri", "value_deg": round(ayan, 5)},
+            "ascendant": {
+                "sidereal_longitude": round(asc_sid, 3),
+                "sign": asc_sign, "degree_in_sign": asc_deg,
+                "nakshatra": asc_nak, "pada": asc_pada,
+            },
+            "houses_whole_sign": houses_whole_sign,
+            "planets": planets,
+            "vimshottari_dasha": {
+                "birth_nakshatra": moon_nak,
+                "birth_nakshatra_lord": moon_lord,
+                "fraction_of_nakshatra_elapsed": round(moon_frac, 4),
+                "mahadasha_sequence": dasha_sequence,
+                "note": (
+                    "Only Mahadasha (major period) level is computed. "
+                    "Antardasha (sub-periods) are not implemented yet. "
+                    "Divisional charts (e.g. D9 Navamsha) are not "
+                    "implemented yet either - this is the D1 Rashi "
+                    "chart only."
+                ),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422,
+                            detail=f"Vedic chart calculation error: {e}")
+
 
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy():
