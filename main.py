@@ -19,7 +19,7 @@ except ImportError:
 app = FastAPI(
     title="Astro Server",
     description="Astrology & Human Design calculation service for Custom GPT",
-    version="5.1",
+    version="5.2",
 )
 
 GEONAMES_USERNAME = os.environ.get("GEONAMES_USERNAME", "")
@@ -120,7 +120,7 @@ def natal_chart(data: BirthData):
         s = AstrologicalSubject(
             data.name, data.year, data.month, data.day,
             data.hour, data.minute, data.city, data.nation,
-            geonames_username="ne_fact",
+            geonames_username=GEONAMES_USERNAME,
         )
         return build_response(s, data.name)
     except Exception as e:
@@ -311,7 +311,6 @@ def compute_human_design(data: BirthDataCoords) -> dict:
         defined_centers.update([ca, cb])
         center_edges.append((ca, cb))
 
-    # connectivity helpers
     def reachable(start: str) -> set:
         seen, stack = {start}, [start]
         while stack:
@@ -356,7 +355,6 @@ def compute_human_design(data: BirthDataCoords) -> dict:
     else:
         authority = "Mental/Environmental"
 
-    # definition (connected components among defined centers)
     remaining = set(defined_centers)
     components = 0
     while remaining:
@@ -418,11 +416,10 @@ def compute_human_design(data: BirthDataCoords) -> dict:
 @app.post("/human_design", dependencies=[Depends(verify_api_key)])
 def human_design(data: BirthDataCoords):
     """Calculate a Human Design bodygraph: type, strategy, authority,
-    profile, definition, centers, channels, gates and both activation
-    sets (Personality at birth, Design at 88 degrees of solar arc
-    before birth). Requires coordinates and timezone - if you only
-    have a city name, call /natal_chart first and take lat/lng/tz
-    from its location_check."""
+    profile, definition, centers, channels and gate activations
+    (Personality and Design). Requires coordinates and timezone;
+    if you only have a city, call /natal_chart first and take
+    lat/lng/tz from location_check."""
     try:
         return compute_human_design(data)
     except Exception as e:
