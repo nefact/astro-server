@@ -1,49 +1,62 @@
-from fastapi import FastAPI
+import os
+
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from kerykeion import AstrologicalSubject
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(
     title="Astro Server",
-    description="Расчёт натальной карты для Custom GPT",
-    version="2.0",
+    description="Natal chart calculation service for Custom GPT",
+    version="3.0",
 )
 
 # ============================================
-# ВАЖНО: впиши сюда свой логин с geonames.org
-# (и не забудь включить free web services
-# на странице geonames.org/manageaccount)
+# Secrets are read from environment variables.
+# Set them in Render: service -> Environment:
+#   GEONAMES_USERNAME = your geonames.org login
+#   API_KEY           = any long random string
 # ============================================
-GEONAMES_USERNAME = "твой_логин"
+GEONAMES_USERNAME = os.environ.get("ne_fact", "")
+API_KEY = os.environ.get("124568390865378656789123567890", "")
 
 
-# ---------- Модели входных данных ----------
+# ---------- API key check ----------
+
+def verify_api_key(x_api_key: str = Header(default="")):
+    """Requests must include header 'X-API-Key' with the correct key.
+    If API_KEY env var is not set, the check is skipped (open mode)."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+# ---------- Input models (with validation) ----------
 
 class BirthData(BaseModel):
     name: str
-    year: int
-    month: int
-    day: int
-    hour: int
-    minute: int
-    city: str          # латиницей, например "Moscow"
-    nation: str = ""   # код страны, например "RU" (желательно указывать)
+    year: int = Field(ge=1000, le=2100)
+    month: int = Field(ge=1, le=12)
+    day: int = Field(ge=1, le=31)
+    hour: int = Field(ge=0, le=23)
+    minute: int = Field(ge=0, le=59)
+    city: str          # Latin spelling, e.g. "Moscow"
+    nation: str = ""   # country code, e.g. "RU" (recommended)
 
 
 class BirthDataCoords(BaseModel):
     name: str
-    year: int
-    month: int
-    day: int
-    hour: int
-    minute: int
-    lat: float         # широта, например 55.7558
-    lng: float         # долгота, например 37.6173
-    tz_str: str        # часовой пояс, например "Europe/Moscow"
+    year: int = Field(ge=1000, le=2100)
+    month: int = Field(ge=1, le=12)
+    day: int = Field(ge=1, le=31)
+    hour: int = Field(ge=0, le=23)
+    minute: int = Field(ge=0, le=59)
+    lat: float = Field(ge=-90, le=90)     # e.g. 55.7558
+    lng: float = Field(ge=-180, le=180)   # e.g. 37.6173
+    tz_str: str                           # e.g. "Europe/Moscow"
     city: str = "Custom location"
 
 
-# ---------- Общая сборка ответа ----------
+# ---------- Shared response builder ----------
 
 def build_response(s: AstrologicalSubject) -> dict:
     return {
@@ -71,38 +84,40 @@ def build_response(s: AstrologicalSubject) -> dict:
     }
 
 
-# ---------- Основной метод: по названию города ----------
+# ---------- Main endpoint: by city name ----------
 
-@app.post("/natal_chart")
+@app.post("/natal_chart", dependencies=[Depends(verify_api_key)])
 def natal_chart(data: BirthData):
-    """Расчёт натальной карты по названию города (через GeoNames).
-    Всегда проверяй location_check в ответе: тот ли город и часовой
-    пояс найден. Если нет — используй /natal_chart_coords."""
+    """Calculate a natal chart by city name (resolved via GeoNames).
+    Always verify location_check in the response: make sure the
+    resolved city, country and timezone are correct. If they are
+    wrong, call /natal_chart_coords instead."""
     try:
         s = AstrologicalSubject(
             data.name, data.year, data.month, data.day,
             data.hour, data.minute, data.city, data.nation,
-            geonames_username="ne_fact",
+            geonames_username=GEONAMES_USERNAME,
         )
     except Exception as e:
-        return {
-            "error": (
-                f"Не удалось определить город '{data.city}': {e}. "
-                "Попробуй название латиницей с кодом страны (nation), "
-                "либо вызови /natal_chart_coords с координатами "
-                "и часовым поясом."
-            )
-        }
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Could not resolve city '{data.city}': {e}. "
+                "Try the Latin spelling with a country code (nation), "
+                "or call /natal_chart_coords with coordinates "
+                "and a timezone."
+            ),
+        )
     return build_response(s)
 
 
-# ---------- Запасной метод: по координатам ----------
+# ---------- Fallback endpoint: by coordinates ----------
 
-@app.post("/natal_chart_coords")
+@app.post("/natal_chart_coords", dependencies=[Depends(verify_api_key)])
 def natal_chart_coords(data: BirthDataCoords):
-    """Надёжный расчёт без геокодинга: широта, долгота и часовой пояс
-    задаются напрямую. Используй, если /natal_chart нашёл не тот город
-    или вернул ошибку."""
+    """Reliable calculation without geocoding: latitude, longitude
+    and timezone are provided directly. Use this if /natal_chart
+    resolved the wrong city or returned an error."""
     try:
         s = AstrologicalSubject(
             data.name, data.year, data.month, data.day,
@@ -111,11 +126,11 @@ def natal_chart_coords(data: BirthDataCoords):
             city=data.city, online=False,
         )
     except Exception as e:
-        return {"error": f"Ошибка расчёта: {e}"}
+        raise HTTPException(status_code=422, detail=f"Calculation error: {e}")
     return build_response(s)
 
 
-# ---------- Политика конфиденциальности ----------
+# ---------- Privacy policy (public, no key needed) ----------
 
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy():
@@ -125,9 +140,8 @@ def privacy():
     not stored, logged, or shared with third parties.</p>"""
 
 
-# ---------- Локальный запуск (для Render не обязателен) ----------
+# ---------- Local run (not required on Render) ----------
 
 if __name__ == "__main__":
-    import os
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
