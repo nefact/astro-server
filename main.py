@@ -19,7 +19,7 @@ except ImportError:
 app = FastAPI(
     title="Astro Server",
     description="Astrology & Human Design calculation service for Custom GPT",
-    version="5.2",
+    version="6.0",
 )
 
 GEONAMES_USERNAME = os.environ.get("GEONAMES_USERNAME", "")
@@ -120,7 +120,7 @@ def natal_chart(data: BirthData):
         s = AstrologicalSubject(
             data.name, data.year, data.month, data.day,
             data.hour, data.minute, data.city, data.nation,
-            geonames_username=GEONAMES_USERNAME,
+            geonames_username="ne_fact",
         )
         return build_response(s, data.name)
     except Exception as e:
@@ -277,7 +277,9 @@ def find_design_jd(jd_birth: float) -> float:
     return jd
 
 
-def compute_human_design(data: BirthDataCoords) -> dict:
+def compute_activations(data: BirthDataCoords):
+    """Shared engine for Human Design and Gene Keys: returns
+    (ut, jd_birth, jd_design, personality, design)."""
     try:
         tz = ZoneInfo(data.tz_str)
     except Exception:
@@ -291,9 +293,13 @@ def compute_human_design(data: BirthDataCoords) -> dict:
     jd_birth = swe.julday(ut.year, ut.month, ut.day,
                           ut.hour + ut.minute / 60 + ut.second / 3600)
     jd_design = find_design_jd(jd_birth)
-
     personality = activations_at(jd_birth)
     design = activations_at(jd_design)
+    return ut, jd_birth, jd_design, personality, design
+
+
+def compute_human_design(data: BirthDataCoords) -> dict:
+    ut, jd_birth, jd_design, personality, design = compute_activations(data)
 
     active_gates = {v["gate"] for v in personality.values()} | \
                    {v["gate"] for v in design.values()}
@@ -425,6 +431,42 @@ def human_design(data: BirthDataCoords):
     except Exception as e:
         raise HTTPException(status_code=422,
                             detail=f"Human Design calculation error: {e}")
+
+
+@app.post("/gene_keys", dependencies=[Depends(verify_api_key)])
+def gene_keys(data: BirthDataCoords):
+    """Calculate the Gene Keys Activation Sequence: Life's Work,
+    Evolution, Radiance and Purpose gates (same engine as the Human
+    Design incarnation cross). Requires coordinates and timezone."""
+    try:
+        ut, jd_birth, jd_design, personality, design = compute_activations(data)
+        return {
+            "verification_note": (
+                "Gate numbers are computed from the same verified "
+                "engine as /human_design. Only the core Activation "
+                "Sequence is included; Venus and Pearl Sequences are "
+                "not implemented yet pending verification against a "
+                "reference source."
+            ),
+            "confidence": {
+                "level": "reliable (reuses verified Human Design engine)",
+            },
+            "activation_sequence": {
+                "life_work": personality["sun"],
+                "evolution": personality["earth"],
+                "radiance": design["sun"],
+                "purpose": design["earth"],
+            },
+            "note_for_model": (
+                "These are gate numbers only (the calculated layer). "
+                "Provide the Gene Keys themes/meanings for each gate "
+                "from your own general knowledge, clearly marked as "
+                "the symbolic/interpretive layer, not as РАСЧЁТ."
+            ),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=422,
+                            detail=f"Gene Keys calculation error: {e}")
 
 
 # =====================================================
