@@ -28,6 +28,7 @@ def natal_chart(data: BirthData):
     s = AstrologicalSubject(
         data.name, data.year, data.month, data.day,
         data.hour, data.minute, data.city, data.nation
+        geonames_username="ne_fact"
     )
     return {
         "sun": s.sun, "moon": s.moon, "mercury": s.mercury,
