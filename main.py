@@ -128,9 +128,9 @@ def natal_chart(data: BirthData):
         s = AstrologicalSubject(
             data.name, data.year, data.month, data.day,
             data.hour, data.minute, data.city, data.nation,
-            geonames_username"ne_fact",
+            geonames_username=GEONAMES_USERNAME,
         )
-        return build_response(s, data.name)
+         return build_response(s, data.name)
     except Exception as e:
         raise HTTPException(
             status_code=422,
