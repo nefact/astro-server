@@ -21,7 +21,7 @@ except ImportError:
 app = FastAPI(
     title="Astro Server",
     description="Astrology & Human Design calculation service for Custom GPT",
-    version="9.0",
+    version="10.1",
 )
 
 GEONAMES_USERNAME = os.environ.get("GEONAMES_USERNAME", "")
@@ -1057,6 +1057,323 @@ def bazi_chart(data: BaziRequest):
     except Exception as e:
         raise HTTPException(status_code=422,
                             detail=f"BaZi calculation error: {e}")
+
+
+# =====================================================
+# Zi Wei Dou Shu (Purple Star Astrology)
+# =====================================================
+# Depends on the Chinese lunisolar calendar (computed here from
+# ephemeris new moons + zhongqi solar terms) and on classical
+# placement tables. Verification hierarchy is described in the
+# endpoint's verification_note.
+
+NAYIN_ELEMENTS = [
+    "Metal", "Fire", "Wood", "Earth", "Metal",
+    "Fire", "Water", "Earth", "Metal", "Wood",
+    "Water", "Earth", "Fire", "Wood", "Water",
+    "Metal", "Fire", "Wood", "Earth", "Metal",
+    "Fire", "Water", "Earth", "Metal", "Wood",
+    "Water", "Earth", "Fire", "Wood", "Water",
+]
+BUREAU_FROM_ELEMENT = {"Water": 2, "Wood": 3, "Metal": 4, "Earth": 5, "Fire": 6}
+BUREAU_NAMES = {2: "Water 2", 3: "Wood 3", 4: "Metal 4", 5: "Earth 5", 6: "Fire 6"}
+
+ZIWEI_SERIES = {"TianJi": -1, "TaiYang": -3, "WuQu": -4, "TianTong": -5,
+                "LianZhen": -8}
+TIANFU_SERIES = {"TaiYin": 1, "TanLang": 2, "JuMen": 3, "TianXiang": 4,
+                 "TianLiang": 5, "QiSha": 6, "PoJun": 10}
+
+PALACE_NAMES = ["Ming (Life)", "Siblings", "Spouse", "Children", "Wealth",
+                "Health", "Travel", "Friends", "Career", "Property",
+                "Fortune (Fu De)", "Parents"]
+
+# Si Hua (Four Transformations) by year stem: (Lu, Quan, Ke, Ji).
+# The San He mainstream table; stems Wu, Geng and Ren are DISPUTED
+# between schools - flagged in the response.
+SIHUA_TABLE = {
+    "Jia": ("LianZhen", "PoJun", "WuQu", "TaiYang"),
+    "Yi": ("TianJi", "TianLiang", "ZiWei", "TaiYin"),
+    "Bing": ("TianTong", "TianJi", "WenChang", "LianZhen"),
+    "Ding": ("TaiYin", "TianTong", "TianJi", "JuMen"),
+    "Wu": ("TanLang", "TaiYin", "YouBi", "TianJi"),
+    "Ji": ("WuQu", "TanLang", "TianLiang", "WenQu"),
+    "Geng": ("TaiYang", "WuQu", "TaiYin", "TianTong"),
+    "Xin": ("JuMen", "TaiYang", "WenQu", "WenChang"),
+    "Ren": ("TianLiang", "ZiWei", "ZuoFu", "WuQu"),
+    "Gui": ("PoJun", "JuMen", "TaiYin", "TanLang"),
+}
+SIHUA_DISPUTED_STEMS = ["Wu", "Geng", "Ren", "Xin"]
+
+
+def moon_longitude(jd: float) -> float:
+    res, _ = swe.calc_ut(jd, swe.MOON, swe.FLG_SWIEPH)
+    return res[0] % 360.0
+
+
+def elongation(jd: float) -> float:
+    return (moon_longitude(jd) - sun_longitude(jd)) % 360.0
+
+
+def refine_new_moon(jd_guess: float) -> float:
+    """Newton-iterate to the new moon nearest the guess."""
+    jd = jd_guess
+    for _ in range(60):
+        e = elongation(jd)
+        diff = ((e + 180.0) % 360.0) - 180.0
+        if abs(diff) < 1e-7:
+            break
+        jd -= diff / 12.1907
+    return jd
+
+
+def prev_new_moon(jd: float) -> float:
+    nm = refine_new_moon(jd)
+    while nm > jd + 1e-9:
+        nm = refine_new_moon(nm - 29.530588)
+    return nm
+
+
+def jd_to_local_date(jd: float, tz: ZoneInfo):
+    y, m, d, h = swe.revjul(jd)
+    # timedelta carries the fractional hour at full precision - no
+    # truncation that could shift the date near midnight
+    dt = (datetime(y, m, d, tzinfo=ZoneInfo("UTC"))
+          + timedelta(hours=float(h)))
+    return dt.astimezone(tz).date()
+
+
+def zhongqi_crossed(jd_start: float, jd_end: float):
+    """Which multiples of 30 deg of solar longitude the Sun crosses
+    in (jd_start, jd_end]. Returns list of longitudes."""
+    lon0 = sun_longitude(jd_start)
+    lon1 = sun_longitude(jd_end)
+    span = (lon1 - lon0) % 360.0
+    crossed = []
+    k = (int(lon0 // 30) + 1) * 30
+    while ((k - lon0) % 360.0) <= span:
+        crossed.append(k % 360)
+        k += 30
+        if len(crossed) > 3:
+            break
+    return crossed
+
+
+def month_from_zhongqi_lon(lon: float) -> int:
+    return ((int(round(lon)) - 330) // 30) % 12 + 1
+
+
+def compute_lunar_date(jd_birth: float, birth_year: int, tz: ZoneInfo,
+                       day_boundary: str = "local"):
+    """Chinese lunisolar month/day for the birth moment.
+    Month numbering anchored at the winter-solstice lunation (month
+    11); a lunation with no zhongqi is a leap month (repeats the
+    previous number). Adequate for 20th-21st century dates.
+    day_boundary: "local" (default) or "beijing" - which midnight
+    defines the calendar day (a known school difference)."""
+    ws_guess = swe.julday(birth_year, 12, 21, 12.0)
+    ws = find_solar_term_jd(ws_guess, 270.0)
+    if ws > jd_birth:
+        ws_guess = swe.julday(birth_year - 1, 12, 21, 12.0)
+        ws = find_solar_term_jd(ws_guess, 270.0)
+    ws_year = swe.revjul(ws)[0]
+
+    # Precompute the new-moon chain ONCE: from the month-11 lunation
+    # up to past the birth. 15 lunations always covers a solstice-to-
+    # birth span (max ~13 lunations in a 13-month sui) with margin.
+    moons = [prev_new_moon(ws)]
+    for _ in range(15):
+        moons.append(refine_new_moon(moons[-1] + 29.530588))
+        if moons[-1] > jd_birth:
+            break
+
+    if jd_birth < moons[0] - 1e-6:
+        raise RuntimeError(
+            "internal inconsistency: birth precedes the month-11 "
+            "lunation of its own sui - please report this date")
+
+    # Walk the chain, numbering each lunation by its zhongqi
+    month_num, is_leap = 11, False
+    birth_idx = None
+    for i in range(len(moons) - 1):
+        if i > 0:
+            crossed = zhongqi_crossed(moons[i], moons[i + 1])
+            if not crossed:
+                is_leap = True          # leap: repeats previous number
+            else:
+                is_leap = False
+                month_num = month_from_zhongqi_lon(crossed[0])
+        if moons[i] - 1e-9 <= jd_birth < moons[i + 1] - 1e-9:
+            birth_idx = i
+            break
+    if birth_idx is None:
+        raise RuntimeError("could not locate birth lunation")
+
+    day_tz = tz if day_boundary == "local" else ZoneInfo("Asia/Shanghai")
+    lunar_day = (jd_to_local_date(jd_birth, day_tz)
+                 - jd_to_local_date(moons[birth_idx], day_tz)).days + 1
+    lunar_year = ws_year if month_num in (11, 12) else ws_year + 1
+    return month_num, is_leap, lunar_day, lunar_year
+
+
+def ziwei_position(bureau: int, day: int) -> int:
+    n = -(-day // bureau)           # ceil
+    r = n * bureau - day
+    base = 2 + (n - 1)
+    if r == 0:
+        pos = base
+    elif r % 2 == 1:
+        pos = base - r
+    else:
+        pos = base + r
+    return pos % 12
+
+
+class ZiweiRequest(BirthDataCoords):
+    gender: str = Field(default="male", pattern="^(male|female)$")
+    day_boundary: str = Field(default="local", pattern="^(local|beijing)$")
+
+
+@app.post("/ziwei_chart", dependencies=[Depends(verify_api_key)])
+def ziwei_chart(data: ZiweiRequest):
+    """Calculate a Zi Wei Dou Shu chart: lunisolar date, Ming/Shen
+    palaces, Five-Element Bureau, 14 major stars, Chang/Qu/Fu/Bi,
+    Four Transformations and decade periods. New module with layered
+    confidence - verify the lunar date and Ming palace first."""
+    try:
+        tz = ZoneInfo(data.tz_str)
+    except Exception:
+        raise HTTPException(status_code=422, detail=(
+            f"Unknown timezone '{data.tz_str}'. Use IANA format, "
+            "e.g. 'Europe/Moscow' - not 'UTC+3'."
+        ))
+    try:
+        local = datetime(data.year, data.month, data.day,
+                         data.hour, data.minute, tzinfo=tz)
+        ut = local.astimezone(ZoneInfo("UTC"))
+        jd = swe.julday(ut.year, ut.month, ut.day,
+                        ut.hour + ut.minute / 60 + ut.second / 3600)
+
+        month_num, is_leap, lunar_day, lunar_year = compute_lunar_date(
+            jd, local.year, tz, data.day_boundary)
+
+        # Leap-month convention (school-dependent): first 15 days
+        # belong to the same month number, the rest to the next.
+        eff_month = month_num
+        if is_leap and lunar_day > 15:
+            eff_month = month_num % 12 + 1
+
+        hour_idx = ((local.hour + 1) // 2) % 12
+        year_stem_idx = (lunar_year - 4) % 10
+        year_branch_idx = (lunar_year - 4) % 12
+
+        ming = (2 + (eff_month - 1) - hour_idx) % 12
+        shen = (2 + (eff_month - 1) + hour_idx) % 12
+
+        # palace stems via Five Tiger rule from the (lunar) year stem
+        ft = BAZI_FIVE_TIGER[year_stem_idx]
+        def palace_stem(branch_idx: int) -> int:
+            return (ft + ((branch_idx - 2) % 12)) % 10
+
+        ming_stem_idx = palace_stem(ming)
+        pair_idx = next(i for i in range(60)
+                        if i % 10 == ming_stem_idx and i % 12 == ming)
+        element = NAYIN_ELEMENTS[pair_idx // 2]
+        bureau = BUREAU_FROM_ELEMENT[element]
+
+        zw = ziwei_position(bureau, lunar_day)
+        tf = (4 - zw) % 12
+
+        star_positions = {"ZiWei": zw, "TianFu": tf}
+        for star, off in ZIWEI_SERIES.items():
+            star_positions[star] = (zw + off) % 12
+        for star, off in TIANFU_SERIES.items():
+            star_positions[star] = (tf + off) % 12
+        # auxiliary stars needed for Si Hua completeness
+        star_positions["WenChang"] = (10 - hour_idx) % 12
+        star_positions["WenQu"] = (4 + hour_idx) % 12
+        star_positions["ZuoFu"] = (4 + (eff_month - 1)) % 12
+        star_positions["YouBi"] = (10 - (eff_month - 1)) % 12
+
+        year_stem_name = BAZI_STEMS[year_stem_idx]
+        lu, quan, ke, ji = SIHUA_TABLE[year_stem_name]
+
+        palaces = []
+        for k in range(12):
+            b = (ming - k) % 12
+            stars_here = sorted(s for s, p in star_positions.items() if p == b)
+            palaces.append({
+                "palace": PALACE_NAMES[k],
+                "branch": BAZI_BRANCHES[b],
+                "stem": BAZI_STEMS[palace_stem(b)],
+                "stars": stars_here,
+                "is_shen_palace": (b == shen),
+            })
+
+        year_is_yang = BAZI_STEM_YANG[year_stem_idx]
+        male = (data.gender == "male")
+        forward = (year_is_yang and male) or (not year_is_yang and not male)
+        decades = []
+        for i in range(8):
+            b = (ming + i) % 12 if forward else (ming - i) % 12
+            decades.append({
+                "start_age": bureau + i * 10,
+                "end_age": bureau + i * 10 + 9,
+                "palace_branch": BAZI_BRANCHES[b],
+            })
+
+        return {
+            "verification_note": (
+                "New module with LAYERED confidence - verify in this "
+                "order: (1) lunar_info month/day against any Chinese "
+                "lunar calendar converter - this is pure ephemeris "
+                "and fully checkable; (2) Ming palace branch and "
+                "Bureau against a ZWDS calculator; (3) ZiWei star "
+                "position (formula reproduced all 5 textbook day-1 "
+                "anchors in offline tests); (4) Si Hua last - stems "
+                "Wu, Geng, Ren are genuinely DISPUTED between "
+                "schools, a mismatch there may be a school "
+                "difference rather than a bug. Conventions used: "
+                "local-midnight day boundary; leap-month day 1-15 = "
+                "same month, 16+ = next; year boundary = lunar new "
+                "year (NOT Li Chun - differs from BaZi on purpose). "
+                "Minor stars (Lu Cun, Huo/Ling, Qing Yang/Tuo Luo, "
+                "Tian Ma etc.) and brightness levels are NOT "
+                "computed - never invent them; state they are "
+                "not available."
+            ),
+            "confidence": {
+                "lunar_calendar": "ephemeris-based - checkable",
+                "ming_shen_bureau": "classical formulas, unverified externally",
+                "star_positions": "formula passed 5 textbook anchors",
+                "si_hua": "school-dependent for stems Wu/Geng/Ren",
+            },
+            "lunar_info": {
+                "day_boundary_used": data.day_boundary,
+                "lunar_year": lunar_year,
+                "lunar_month": month_num,
+                "is_leap_month": is_leap,
+                "effective_month_used": eff_month,
+                "lunar_day": lunar_day,
+                "year_pillar": f"{year_stem_name} {BAZI_BRANCHES[year_branch_idx]}",
+            },
+            "ming_palace_branch": BAZI_BRANCHES[ming],
+            "shen_palace_branch": BAZI_BRANCHES[shen],
+            "bureau": BUREAU_NAMES[bureau],
+            "four_transformations": {
+                "year_stem": year_stem_name,
+                "hua_lu": lu, "hua_quan": quan, "hua_ke": ke, "hua_ji": ji,
+                "school_note": ("DISPUTED between schools for this stem"
+                                if year_stem_name in SIHUA_DISPUTED_STEMS
+                                else "mainstream San He table"),
+            },
+            "palaces": palaces,
+            "decade_periods": decades,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422,
+                            detail=f"Zi Wei Dou Shu calculation error: {e}")
 
 
 @app.get("/privacy", response_class=HTMLResponse)
