@@ -21,7 +21,7 @@ except ImportError:
 app = FastAPI(
     title="Astro Server",
     description="Astrology & Human Design calculation service for Custom GPT",
-    version="10.1",
+    version="10.2",
 )
 
 GEONAMES_USERNAME = os.environ.get("GEONAMES_USERNAME", "")
@@ -1374,6 +1374,109 @@ def ziwei_chart(data: ZiweiRequest):
     except Exception as e:
         raise HTTPException(status_code=422,
                             detail=f"Zi Wei Dou Shu calculation error: {e}")
+
+
+# =====================================================
+# Vedic D7 Saptamsha (children / progeny divisional chart)
+# =====================================================
+# Pure arithmetic on top of the already-verified sidereal layer:
+# each sign is split into 7 parts of 30/7 degrees; odd signs count
+# the parts from the sign itself, even signs from the 7th sign
+# (classical Parashara rule).
+
+D7_SPAN = 30.0 / 7.0
+
+
+def d7_sign_index(sid_lon: float) -> int:
+    s = int(sid_lon // 30) % 12
+    d = sid_lon % 30
+    part = int(d // D7_SPAN)
+    if part > 6:
+        part = 6                    # guard the exact 30.0 edge
+    odd_sign = (s % 2 == 0)         # index 0 = Aries = 1st (odd) sign
+    start = s if odd_sign else (s + 6) % 12
+    return (start + part) % 12
+
+
+@app.post("/vedic_d7", dependencies=[Depends(verify_api_key)])
+def vedic_d7(data: BirthDataCoords):
+    """Calculate the D7 Saptamsha divisional chart (children/progeny)
+    from the same verified sidereal engine as /vedic_chart: D7 sign
+    for the Ascendant and all planets plus Rahu/Ketu, with whole-sign
+    houses from the D7 Lagna. Requires coordinates and timezone."""
+    try:
+        tz = ZoneInfo(data.tz_str)
+    except Exception:
+        raise HTTPException(status_code=422, detail=(
+            f"Unknown timezone '{data.tz_str}'. Use IANA format, "
+            "e.g. 'Europe/Moscow' - not 'UTC+3'."
+        ))
+    try:
+        local = datetime(data.year, data.month, data.day,
+                         data.hour, data.minute, tzinfo=tz)
+        ut = local.astimezone(ZoneInfo("UTC"))
+        jd = swe.julday(ut.year, ut.month, ut.day,
+                        ut.hour + ut.minute / 60 + ut.second / 3600)
+
+        ayan = ayanamsha_deg(jd)
+
+        cusps, ascmc = swe.houses_ex(jd, data.lat, data.lng, b"P")
+        asc_sid = (ascmc[0] - ayan) % 360.0
+        d7_lagna_idx = d7_sign_index(asc_sid)
+
+        def entry(sid_lon: float) -> dict:
+            idx = d7_sign_index(sid_lon)
+            return {
+                "d1_sidereal_longitude": round(sid_lon, 3),
+                "d7_sign": RASHIS[idx],
+                "d7_house_from_lagna": ((idx - d7_lagna_idx) % 12) + 1,
+            }
+
+        planets = {}
+        for key, body in VEDIC_BODIES:
+            trop, speed = tropical_lon_and_speed(jd, body)
+            sid = (trop - ayan) % 360.0
+            planets[key] = entry(sid)
+            planets[key]["retrograde"] = speed < 0
+
+        true_node_trop, _ = tropical_lon_and_speed(jd, swe.TRUE_NODE)
+        mean_node_trop, _ = tropical_lon_and_speed(jd, swe.MEAN_NODE)
+        for label, trop in (("rahu_true_node", true_node_trop),
+                            ("rahu_mean_node", mean_node_trop)):
+            sid = (trop - ayan) % 360.0
+            planets[label] = entry(sid)
+            planets[label.replace("rahu", "ketu")] = entry((sid + 180.0) % 360.0)
+
+        return {
+            "verification_note": (
+                "D7 is pure arithmetic on the sidereal layer already "
+                "verified against Prokerala (ayanamsha, Moon nakshatra "
+                "and sign matched). The Parashara counting rule (odd "
+                "signs from self, even from the 7th) passed anchor and "
+                "boundary tests offline. Spot-check the D7 Lagna "
+                "against a Jyotish calculator that shows Saptamsha "
+                "for extra confidence. Interpretation of D7 houses "
+                "(children, creativity, lineage) is the symbolic "
+                "layer - not part of this calculation."
+            ),
+            "confidence": {
+                "level": "high (arithmetic over verified sidereal positions)",
+            },
+            "ayanamsha": {"mode": "Lahiri", "value_deg": round(ayan, 5)},
+            "d7_lagna": {
+                "d1_ascendant_sidereal": round(asc_sid, 3),
+                "d7_sign": RASHIS[d7_lagna_idx],
+            },
+            "houses_whole_sign": {
+                str(h + 1): RASHIS[(d7_lagna_idx + h) % 12] for h in range(12)
+            },
+            "planets": planets,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422,
+                            detail=f"D7 Saptamsha calculation error: {e}")
 
 
 @app.get("/privacy", response_class=HTMLResponse)
