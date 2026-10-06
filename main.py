@@ -3,6 +3,7 @@ import glob
 import math
 import os
 import tempfile
+import threading
 import urllib.parse
 from datetime import datetime, timedelta
 from typing import Optional
@@ -19,7 +20,7 @@ try:
 except ImportError:
     KerykeionChartSVG = None
 
-SERVER_VERSION = "12.0"
+SERVER_VERSION = "12.4"
 
 app = FastAPI(
     title="Astro Server",
@@ -52,7 +53,8 @@ ENGINES = {
         "method": "Tropical zodiac, Placidus houses, true lunar node",
         "verification": "Positions and Ascendant matched an independent "
                         "Swiss Ephemeris WebAssembly build (app team) "
-                        "within ~0.005 deg",
+                        "within ~0.005 deg; set SE_EPHE_PATH to Swiss "
+                        "data files so all modules share one ephemeris",
         "status": "verified",
     },
     "predictive": {
@@ -224,19 +226,69 @@ ENGINES = {
 SYMBOLIC_LAYERS = ["Tarot readings", "Tree of Sephirot", "Chakras / energy",
                    "Ancestral and karmic scenarios", "Bon symbolic layer",
                    "Akashic records (metaphor)", "Star archetypes (metaphor)"]
-_EPHEMERIS_STATUS = {}
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+EPHE_DIR = os.path.join(APP_DIR, "ephe")
+EPHE_CANDIDATES = (EPHE_DIR, APP_DIR)   # ./ephe folder or next to main.py
+EPHE_FILES = ("sepl_18.se1", "semo_18.se1")   # planets and Moon, 1800-2399
+EPHE_SOURCE = "https://raw.githubusercontent.com/aloistr/swisseph/master/ephe/"
+_EPHE_DOWNLOAD = {"state": "not started", "error": None}
+# Swiss Ephemeris keeps global state and set_ephe_path closes its open
+# files, so all calculations run one at a time under this lock.
+_CALC_LOCK = threading.RLock()
+
+
+def _ephe_files_present(folder: Optional[str]) -> bool:
+    return bool(folder) and all(
+        os.path.isfile(os.path.join(folder, f))
+        and os.path.getsize(os.path.join(folder, f)) > 100_000
+        for f in EPHE_FILES)
+
+
+def _download_ephemeris():
+    """Fetch the official Swiss Ephemeris data files once at startup so
+    no manual upload is needed. Runs in the background; until it
+    finishes (or if it fails) Swiss Ephemeris uses its Moshier model."""
+    import urllib.request
+    try:
+        _EPHE_DOWNLOAD["state"] = "downloading"
+        os.makedirs(EPHE_DIR, exist_ok=True)
+        for name in EPHE_FILES:
+            target = os.path.join(EPHE_DIR, name)
+            if os.path.isfile(target) and os.path.getsize(target) > 100_000:
+                continue
+            tmp = target + ".part"
+            with urllib.request.urlopen(EPHE_SOURCE + name, timeout=60) as r,                     open(tmp, "wb") as f:
+                f.write(r.read())
+            if os.path.getsize(tmp) < 100_000:
+                raise RuntimeError(f"{name}: downloaded file is too small")
+            os.replace(tmp, target)
+        _EPHE_DOWNLOAD["state"] = "done"
+    except Exception as e:
+        _EPHE_DOWNLOAD.update(state="failed", error=str(e))
+
+
+def _local_ephe_dir() -> Optional[str]:
+    return next((d for d in EPHE_CANDIDATES if _ephe_files_present(d)), None)
+
+
+def start_ephemeris_download():
+    if os.environ.get("SE_EPHE_PATH") or _local_ephe_dir():
+        _EPHE_DOWNLOAD["state"] = "not needed"
+        return
+    threading.Thread(target=_download_ephemeris, daemon=True).start()
 
 
 def init_ephemeris() -> Optional[str]:
     """Point Swiss Ephemeris at real data files so every module uses the
-    same ephemeris. Without files it silently falls back to Moshier."""
-    path = os.environ.get("SE_EPHE_PATH")
+    same ephemeris. Order: SE_EPHE_PATH, an ./ephe folder or the files
+    next to main.py, Kerykeion's folder. Re-applied before every endpoint call, because
+    Kerykeion resets the path whenever it builds a natal chart."""
+    path = os.environ.get("SE_EPHE_PATH") or _local_ephe_dir()
     if not path:
         try:
             import kerykeion as _k
             cand = os.path.join(os.path.dirname(_k.__file__), "sweph")
-            if os.path.isdir(cand):
-                path = cand
+            path = cand if os.path.isdir(cand) else None
         except Exception:
             path = None
     if path:
@@ -245,19 +297,22 @@ def init_ephemeris() -> Optional[str]:
 
 
 def ephemeris_backend() -> dict:
-    if not _EPHEMERIS_STATUS:
+    with _CALC_LOCK:
         path = init_ephemeris()
         try:
             _, flag = swe.calc_ut(2451545.0, swe.SUN, swe.FLG_SWIEPH)
             files = bool(flag & swe.FLG_SWIEPH) and not (flag & swe.FLG_MOSEPH)
         except Exception:
             files = False
-        _EPHEMERIS_STATUS.update({
-            "backend": ("Swiss Ephemeris data files" if files
-                        else "Moshier analytical fallback (no data files)"),
-            "ephe_path": path,
-        })
-    return dict(_EPHEMERIS_STATUS)
+    return {
+        "backend": ("Swiss Ephemeris data files" if files
+                    else "Moshier analytical fallback (no data files)"),
+        "ephe_path": path,
+        "auto_download": dict(_EPHE_DOWNLOAD),
+    }
+
+
+start_ephemeris_download()
 
 
 def engine_info(system_id: str) -> dict:
@@ -274,9 +329,11 @@ def with_engine(system_id: str):
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            result = fn(*args, **kwargs)
-            if isinstance(result, dict):
-                result["engine"] = engine_info(system_id)
+            with _CALC_LOCK:
+                init_ephemeris()
+                result = fn(*args, **kwargs)
+                if isinstance(result, dict):
+                    result["engine"] = engine_info(system_id)
             return result
         return wrapper
     return deco
@@ -412,6 +469,7 @@ def natal_chart_coords(data: BirthDataCoords):
 
 
 @app.get("/chart.svg")
+@with_engine("western_natal")       # serialised; SVG responses get no engine block
 def chart_svg(
     name: str = Query(default="Chart"),
     year: int = Query(ge=1000, le=2100),
